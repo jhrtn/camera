@@ -14,12 +14,13 @@
     overflow: hidden;
   }
 
-  body { cursor: none; touch-action: none; }
+  body { touch-action: none; }
 
   canvas {
     display: block;
     width: 100%;
     height: 100%;
+    cursor: none;
   }
 
   #status {
@@ -35,10 +36,22 @@
   }
   #status[hidden] { display: none; }
 </style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
+    "leva": "https://esm.sh/leva@0.10.0?external=react,react-dom"
+  }
+}
+</script>
 </head>
 <body>
   <canvas id="stage"></canvas>
   <div id="status">Waiting for camera</div>
+  <div id="controls"></div>
 
 <script type="module">
 const canvas = document.getElementById('stage');
@@ -46,14 +59,31 @@ const statusEl = document.getElementById('status');
 const fail = msg => { statusEl.hidden = false; statusEl.textContent = msg; };
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-/* ---- shared uniform block (80 bytes) ---- */
+/* ---- live parameters; the leva panel writes into this ---- */
+const params = {
+  density: 72,       // tiles across the short side
+  gap: 0,            // px between tiles
+  gridLines: 0.055,  // opacity of the grid behind the tiles
+  mirror: true,
+  cursor: true,
+  push: 32,
+  reach: 7,          // push radius, in cells
+  carry: 0.15,       // how much tiles get dragged along with the stroke
+  fullSpeed: 10,     // css px / frame that counts as a full push
+  spring: 0.07,
+  damping: 0.86,
+  fade: 0.55,        // how far displaced tiles fade, at most
+};
+
+/* ---- shared uniform block (128 bytes) ---- */
 const UNIFORMS = /* wgsl */ `
   struct U {
     res: vec2f,      // css px
     off: vec2f,      // grid phase
-    pointer: vec2f,  // mirrored css px
+    pointer: vec2f,  // css px, in feed space (mirrored when the feed is)
     vOff: vec2f,     // cover-fit crop, video px
     vSize: vec2f,    // video px
+    vel: vec2f,      // smoothed pointer velocity, feed-space css px / frame
     cell: f32,
     cols: f32,
     count: f32,
@@ -61,6 +91,16 @@ const UNIFORMS = /* wgsl */ `
     inset: f32,
     dpr: f32,
     vScale: f32,
+    energy: f32,     // 0 when the pointer is still, ~1 on a fast drag
+    push: f32,
+    reach: f32,
+    carry: f32,
+    spring: f32,
+    damping: f32,
+    fade: f32,
+    gridLines: f32,
+    mirror: f32,
+    cursor: f32,
   };
   struct Tile { pos: vec2f, vel: vec2f };
 
@@ -73,6 +113,10 @@ const UNIFORMS = /* wgsl */ `
   fn snapToGrid(p: vec2f) -> vec2f {
     return round((p - u.off) / u.cell) * u.cell + u.off;
   }
+  // feed space -> screen x, flipping when mirrored
+  fn screenX(x: f32) -> f32 {
+    return select(x, u.res.x - x, u.mirror > 0.5);
+  }
 `;
 
 /* ---- physics: same spring / push as hello, one thread per tile ---- */
@@ -81,29 +125,28 @@ const COMPUTE = /* wgsl */ `
   @group(0) @binding(1) var<storage, read_write> tiles: array<Tile>;
   ${UNIFORMS}
 
-  const SPRING = 0.07;
-  const DAMP   = 0.86;
-  const PUSH   = 32.0;
-  const REACH  = 7.0;   // push radius, in cells
-
   @compute @workgroup_size(64)
   fn main(@builtin(global_invocation_id) id: vec3u) {
     let i = id.x;
     if (i >= u32(u.count)) { return; }
     var t = tiles[i];
 
-    if (u.engaged > 0.5) {
+    // only a moving pointer disturbs the grid, so a resting one lets it heal
+    if (u.engaged > 0.5 && u.energy > 0.001) {
       // push from the tile's centre so the wake is symmetric round the cursor
       let d = t.pos + u.cell * 0.5 - u.pointer;
       let dist = max(length(d), 0.001);
-      let radius = u.cell * REACH;
+      let radius = u.cell * u.reach;
       if (dist < radius) {
-        t.vel += d * (pow(1.0 - dist / radius, 2.0) * PUSH / dist);
+        let falloff = pow(1.0 - dist / radius, 2.0);
+        t.vel += d * (falloff * u.push * u.energy / dist);
+        // and carry tiles along the stroke, shuffling them into other cells
+        t.vel += u.vel * falloff * u.carry;
       }
     }
 
-    t.vel += (homeOf(i) - t.pos) * SPRING;
-    t.vel *= DAMP;
+    t.vel += (homeOf(i) - t.pos) * u.spring;
+    t.vel *= u.damping;
     t.pos += t.vel;
     tiles[i] = t;
   }
@@ -150,9 +193,8 @@ const TILES = /* wgsl */ `
     let src = home + u.inset + q * size;
 
     out.uv = (src / u.vScale + u.vOff) / u.vSize;
-    // everything lives in mirrored space; flip x on the way out
-    out.pos = vec4f(1.0 - 2.0 * p.x / u.res.x, 1.0 - 2.0 * p.y / u.res.y, 0.0, 1.0);
-    out.alpha = select(1.0, 1.0 - min(length(d) / u.cell / 14.0, 0.55), moved);
+    out.pos = vec4f(2.0 * screenX(p.x) / u.res.x - 1.0, 1.0 - 2.0 * p.y / u.res.y, 0.0, 1.0);
+    out.alpha = select(1.0, 1.0 - min(length(d) / u.cell / 14.0, u.fade), moved);
     return out;
   }
 
@@ -173,22 +215,22 @@ const OVERLAY = /* wgsl */ `
     return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
   }
 
-  fn mirrored(fp: vec4f) -> vec2f {
-    return vec2f(u.res.x - fp.x / u.dpr, fp.y / u.dpr);
+  fn feedSpace(fp: vec4f) -> vec2f {
+    return vec2f(screenX(fp.x / u.dpr), fp.y / u.dpr);
   }
 
   @fragment
   fn grid(@builtin(position) fp: vec4f) -> @location(0) vec4f {
-    let k = (mirrored(fp) - u.off) / u.cell;
+    let k = (feedSpace(fp) - u.off) / u.cell;
     let dist = abs(k - round(k)) * u.cell;
     let on = min(dist.x, dist.y) < 0.5;
-    return vec4f(INK * select(0.0, 0.055, on), 1.0);
+    return vec4f(INK * select(0.0, u.gridLines, on), 1.0);
   }
 
   @fragment
   fn cursor(@builtin(position) fp: vec4f) -> @location(0) vec4f {
-    if (u.engaged < 0.5) { discard; }
-    let css = mirrored(fp);
+    if (u.engaged < 0.5 || u.cursor < 0.5) { discard; }
+    let css = feedSpace(fp);
     let tl = floor((u.pointer - u.off) / u.cell) * u.cell + u.off;
     let l = css - tl;
     let edge = min(min(l.x, l.y), min(u.cell - l.x, u.cell - l.y));
@@ -246,7 +288,7 @@ async function main() {
   const gridPipe = render(overlayModule, 'vs', 'grid', false);
   const cursorPipe = render(overlayModule, 'vs', 'cursor', true);
 
-  const uniformData = new Float32Array(20);
+  const uniformData = new Float32Array(32);
   const uniformBuf = device.createBuffer({ size: uniformData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const layerBufs = [0, 1].map(v => {
     const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -266,9 +308,7 @@ async function main() {
 
   /* ---- layout: size the grid, centre it, give every cell a tile ---- */
   let W = 0, H = 0, dpr = 1, cell = 0, cols = 0, rows = 0, offX = 0, offY = 0, count = 0;
-  let density = 72;   // tiles across the short side; [ and ] to change
-  const GAPS = [0, 1, 5];   // px between tiles; g to cycle
-  let gap = 0;
+  let laidOut = '';
   let tileBuf, physicsBind;
 
   const layout = () => {
@@ -279,7 +319,7 @@ async function main() {
     canvas.height = Math.round(H * dpr);
 
     // the gap widens the pitch rather than eating into the tile
-    cell = Math.max(3, Math.round(Math.min(W, H) / density)) + GAPS[gap];
+    cell = Math.max(3, Math.round(Math.min(W, H) / params.density)) + params.gap;
     cols = Math.ceil(W / cell);
     rows = Math.ceil(H / cell);
     offX = (W - cols * cell) / 2;
@@ -302,31 +342,40 @@ async function main() {
         { binding: 1, resource: { buffer: tileBuf } },
       ],
     });
+    laidOut = `${W}x${H}@${dpr}:${params.density}/${params.gap}`;
   };
+  // rebuild whenever the window or a grid-shaping control changes
+  const layoutKey = () => `${innerWidth}x${innerHeight}@${Math.min(devicePixelRatio || 1, 2)}:${params.density}/${params.gap}`;
 
-  /* ---- pointer ---- */
-  const pointer = { x: -9999, y: -9999, active: false };
-  // the feed is mirrored, so the pointer is mirrored into the same space
-  addEventListener('pointermove', e => {
-    pointer.x = W - e.clientX;
+  /* ---- pointer, tracked on the canvas so using the panel leaves the grid alone ---- */
+  const pointer = { x: 0, y: 0, active: false };
+  canvas.addEventListener('pointermove', e => {
+    pointer.x = e.clientX;
     pointer.y = e.clientY;
     pointer.active = true;
   }, { passive: true });
-  document.addEventListener('pointerleave', () => {
-    pointer.active = false;
-    pointer.x = pointer.y = -9999;
-  });
-  addEventListener('resize', layout);
-  addEventListener('keydown', e => {
-    if (e.key === ']') density = Math.min(density * 1.25, 400);
-    else if (e.key === '[') density = Math.max(density / 1.25, 8);
-    else if (e.key === 'g') gap = (gap + 1) % GAPS.length;
-    else return;
-    layout();
-  });
+  canvas.addEventListener('pointerleave', () => { pointer.active = false; });
+
+  /* ---- pointer motion, smoothed so pointer events and frames needn't line up ---- */
+  const motion = { lastX: 0, lastY: 0, vx: 0, vy: 0, seen: false };
+  const trackMotion = () => {
+    if (!pointer.active) { motion.seen = false; motion.vx = motion.vy = 0; return 0; }
+    const dx = motion.seen ? pointer.x - motion.lastX : 0;
+    const dy = motion.seen ? pointer.y - motion.lastY : 0;
+    motion.lastX = pointer.x;
+    motion.lastY = pointer.y;
+    motion.seen = true;
+    motion.vx = motion.vx * 0.75 + dx * 0.25;
+    motion.vy = motion.vy * 0.75 + dy * 0.25;
+    return Math.min(Math.hypot(motion.vx, motion.vy) / params.fullSpeed, 1.5);
+  };
 
   /* ---- frame ---- */
   const frame = () => {
+    if (layoutKey() !== laidOut) layout();
+
+    const energy = trackMotion();
+    const flip = params.mirror ? -1 : 1;
     const vw = video.videoWidth, vh = video.videoHeight;
     const ready = video.readyState >= 2 && vw > 0;
     const vScale = ready ? Math.max(W / vw, H / vh) : 1;
@@ -334,14 +383,21 @@ async function main() {
     uniformData.set([
       W, H,
       offX, offY,
-      pointer.x, pointer.y,
+      params.mirror ? W - pointer.x : pointer.x, pointer.y,
       ready ? (vw - W / vScale) / 2 : 0, ready ? (vh - H / vScale) / 2 : 0,
       vw || 1, vh || 1,
+      motion.vx * flip, motion.vy,
       cell, cols, count,
       pointer.active && !reduced ? 1 : 0,
-      GAPS[gap] / 2,
+      params.gap / 2,
       dpr,
       vScale,
+      energy,
+      params.push, params.reach, params.carry,
+      params.spring, params.damping, params.fade,
+      params.gridLines,
+      params.mirror ? 1 : 0,
+      params.cursor ? 1 : 0,
     ]);
     device.queue.writeBuffer(uniformBuf, 0, uniformData);
 
@@ -398,7 +454,62 @@ async function main() {
   requestAnimationFrame(frame);
 }
 
+/* ---- controls: a leva panel, loaded separately so the sketch runs without it ---- */
+async function mountControls() {
+  const [React, { createRoot }, { Leva, useControls, folder }] = await Promise.all([
+    import('react'), import('react-dom/client'), import('leva'),
+  ]);
+  const h = React.createElement;
+  const GAP_STEPS = [0, 1, 5];
+
+  function Controls() {
+    const [hidden, setHidden] = React.useState(false);
+    const [values, set] = useControls(() => ({
+      grid: folder({
+        density: { value: params.density, min: 8, max: 300, step: 1, label: 'tiles' },
+        gap: { value: params.gap, min: 0, max: 10, step: 1, label: 'gap px' },
+        gridLines: { value: params.gridLines, min: 0, max: 0.4, step: 0.005, label: 'grid lines' },
+        mirror: params.mirror,
+        cursor: { value: params.cursor, label: 'cursor cell' },
+      }),
+      motion: folder({
+        push: { value: params.push, min: 0, max: 120, step: 1 },
+        reach: { value: params.reach, min: 1, max: 24, step: 0.5, label: 'reach cells' },
+        carry: { value: params.carry, min: 0, max: 1, step: 0.01 },
+        fullSpeed: { value: params.fullSpeed, min: 1, max: 40, step: 0.5, label: 'full speed' },
+        spring: { value: params.spring, min: 0.005, max: 0.3, step: 0.005 },
+        damping: { value: params.damping, min: 0.5, max: 0.99, step: 0.01 },
+        fade: { value: params.fade, min: 0, max: 1, step: 0.01, label: 'trail fade' },
+      }),
+    }));
+
+    // the frame loop reads params every frame, so this is all the wiring it needs
+    Object.assign(params, values);
+
+    // keyboard shortcuts go through leva so the panel stays in sync
+    React.useEffect(() => {
+      const onKey = e => {
+        if (e.target.closest?.('input, textarea')) return;
+        if (e.key === ']') set({ density: Math.min(Math.round(params.density * 1.25), 300) });
+        else if (e.key === '[') set({ density: Math.max(Math.round(params.density / 1.25), 8) });
+        else if (e.key === 'g') {
+          const i = GAP_STEPS.indexOf(params.gap);
+          set({ gap: GAP_STEPS[(i + 1) % GAP_STEPS.length] });
+        }
+        else if (e.key === 'h') setHidden(v => !v);
+      };
+      addEventListener('keydown', onKey);
+      return () => removeEventListener('keydown', onKey);
+    }, [set]);
+
+    return h(Leva, { hidden, titleBar: { title: 'camera grid · h to hide' } });
+  }
+
+  createRoot(document.getElementById('controls')).render(h(Controls));
+}
+
 main().catch(err => { console.error(err); fail(err.message); });
+mountControls().catch(err => console.warn('controls unavailable', err));
 </script>
 </body>
 </html>
