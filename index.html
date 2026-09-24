@@ -1,95 +1,404 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Camera</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      background: #0b0b0b;
-      color: #eee;
-      font: 14px/1.4 system-ui, sans-serif;
-    }
-    main { width: min(960px, 100vw - 32px); display: grid; gap: 12px; }
-    video {
-      width: 100%;
-      aspect-ratio: 16 / 9;
-      background: #000;
-      border-radius: 8px;
-      object-fit: cover;
-    }
-    video.mirrored { transform: scaleX(-1); }
-    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    select, button {
-      font: inherit;
-      color: inherit;
-      background: #1c1c1c;
-      border: 1px solid #333;
-      border-radius: 6px;
-      padding: 6px 10px;
-    }
-    button { cursor: pointer; }
-    #status { color: #888; margin-left: auto; }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Camera Grid</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+
+  body { cursor: none; touch-action: none; }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  #status {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: rgba(244, 241, 234, 0.5);
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    pointer-events: none;
+  }
+  #status[hidden] { display: none; }
+</style>
 </head>
 <body>
-  <main>
-    <video id="video" class="mirrored" autoplay playsinline muted></video>
-    <div class="controls">
-      <select id="devices" aria-label="Camera"></select>
-      <button id="mirror">Mirror: on</button>
-      <span id="status">Requesting camera…</span>
-    </div>
-  </main>
+  <canvas id="stage"></canvas>
+  <div id="status">Waiting for camera</div>
 
-  <script>
-    const video = document.getElementById('video');
-    const devicesEl = document.getElementById('devices');
-    const mirrorBtn = document.getElementById('mirror');
-    const statusEl = document.getElementById('status');
-    let stream;
+<script type="module">
+const canvas = document.getElementById('stage');
+const statusEl = document.getElementById('status');
+const fail = msg => { statusEl.hidden = false; statusEl.textContent = msg; };
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    async function start(deviceId) {
-      stream?.getTracks().forEach((t) => t.stop());
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: deviceId
-            ? { deviceId: { exact: deviceId } }
-            : { width: { ideal: 1920 }, height: { ideal: 1080 } },
-          audio: false,
-        });
-        video.srcObject = stream;
-        const s = stream.getVideoTracks()[0].getSettings();
-        statusEl.textContent = `${s.width}×${s.height} @ ${Math.round(s.frameRate ?? 0)}fps`;
-        await listDevices(s.deviceId);
-      } catch (err) {
-        statusEl.textContent = `Camera error: ${err.name}`;
-        console.error(err);
+/* ---- shared uniform block (80 bytes) ---- */
+const UNIFORMS = /* wgsl */ `
+  struct U {
+    res: vec2f,      // css px
+    off: vec2f,      // grid phase
+    pointer: vec2f,  // mirrored css px
+    vOff: vec2f,     // cover-fit crop, video px
+    vSize: vec2f,    // video px
+    cell: f32,
+    cols: f32,
+    count: f32,
+    engaged: f32,
+    inset: f32,
+    dpr: f32,
+    vScale: f32,
+  };
+  struct Tile { pos: vec2f, vel: vec2f };
+
+  const INK = vec3f(244.0, 241.0, 234.0) / 255.0;
+
+  fn homeOf(i: u32) -> vec2f {
+    let cols = u32(u.cols);
+    return u.off + vec2f(f32(i % cols), f32(i / cols)) * u.cell;
+  }
+  fn snapToGrid(p: vec2f) -> vec2f {
+    return round((p - u.off) / u.cell) * u.cell + u.off;
+  }
+`;
+
+/* ---- physics: same spring / push as hello, one thread per tile ---- */
+const COMPUTE = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<storage, read_write> tiles: array<Tile>;
+  ${UNIFORMS}
+
+  const SPRING = 0.07;
+  const DAMP   = 0.86;
+  const PUSH   = 32.0;
+  const REACH  = 7.0;   // push radius, in cells
+
+  @compute @workgroup_size(64)
+  fn main(@builtin(global_invocation_id) id: vec3u) {
+    let i = id.x;
+    if (i >= u32(u.count)) { return; }
+    var t = tiles[i];
+
+    if (u.engaged > 0.5) {
+      // push from the tile's centre so the wake is symmetric round the cursor
+      let d = t.pos + u.cell * 0.5 - u.pointer;
+      let dist = max(length(d), 0.001);
+      let radius = u.cell * REACH;
+      if (dist < radius) {
+        t.vel += d * (pow(1.0 - dist / radius, 2.0) * PUSH / dist);
       }
     }
 
-    async function listDevices(activeId) {
-      const cams = (await navigator.mediaDevices.enumerateDevices())
-        .filter((d) => d.kind === 'videoinput');
-      devicesEl.innerHTML = cams
-        .map((d, i) => `<option value="${d.deviceId}">${d.label || `Camera ${i + 1}`}</option>`)
-        .join('');
-      devicesEl.value = activeId;
+    t.vel += (homeOf(i) - t.pos) * SPRING;
+    t.vel *= DAMP;
+    t.pos += t.vel;
+    tiles[i] = t;
+  }
+`;
+
+/* ---- tiles: instanced quads, drawn snapped to the grid, sampling their home patch ---- */
+const TILES = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<storage, read> tiles: array<Tile>;
+  @group(0) @binding(2) var samp: sampler;
+  @group(0) @binding(3) var feed: texture_external;
+  @group(0) @binding(4) var<uniform> layer: vec4f;   // x: 0 = tiles at home, 1 = displaced
+  ${UNIFORMS}
+
+  struct VOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+    @location(1) alpha: f32,
+  };
+
+  @vertex
+  fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+    var quad = array<vec2f, 6>(
+      vec2f(0, 0), vec2f(1, 0), vec2f(0, 1),
+      vec2f(0, 1), vec2f(1, 0), vec2f(1, 1),
+    );
+    var out: VOut;
+
+    let home = homeOf(ii);
+    // the tile drifts freely, but it is only ever *drawn* in a grid cell
+    let g = snapToGrid(tiles[ii].pos);
+    let d = g - home;
+    let moved = dot(d, d) > 0.25;
+
+    // two layers so displaced tiles always sit on top of the ones at home
+    if (moved != (layer.x > 0.5)) {
+      out.pos = vec4f(2.0, 2.0, 0.0, 1.0);
+      return out;
     }
 
-    devicesEl.addEventListener('change', () => start(devicesEl.value));
-    mirrorBtn.addEventListener('click', () => {
-      const on = video.classList.toggle('mirrored');
-      mirrorBtn.textContent = `Mirror: ${on ? 'on' : 'off'}`;
+    let q = quad[vi];
+    let size = u.cell - 2.0 * u.inset;
+    let p = g + u.inset + q * size;
+    let src = home + u.inset + q * size;
+
+    out.uv = (src / u.vScale + u.vOff) / u.vSize;
+    // everything lives in mirrored space; flip x on the way out
+    out.pos = vec4f(1.0 - 2.0 * p.x / u.res.x, 1.0 - 2.0 * p.y / u.res.y, 0.0, 1.0);
+    out.alpha = select(1.0, 1.0 - min(length(d) / u.cell / 14.0, 0.55), moved);
+    return out;
+  }
+
+  @fragment
+  fn fs(in: VOut) -> @location(0) vec4f {
+    return vec4f(textureSampleBaseClampToEdge(feed, samp, in.uv).rgb, in.alpha);
+  }
+`;
+
+/* ---- full-screen passes: the faint grid underneath, the cursor cell on top ---- */
+const OVERLAY = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> u: U;
+  ${UNIFORMS}
+
+  @vertex
+  fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  }
+
+  fn mirrored(fp: vec4f) -> vec2f {
+    return vec2f(u.res.x - fp.x / u.dpr, fp.y / u.dpr);
+  }
+
+  @fragment
+  fn grid(@builtin(position) fp: vec4f) -> @location(0) vec4f {
+    let k = (mirrored(fp) - u.off) / u.cell;
+    let dist = abs(k - round(k)) * u.cell;
+    let on = min(dist.x, dist.y) < 0.5;
+    return vec4f(INK * select(0.0, 0.055, on), 1.0);
+  }
+
+  @fragment
+  fn cursor(@builtin(position) fp: vec4f) -> @location(0) vec4f {
+    if (u.engaged < 0.5) { discard; }
+    let css = mirrored(fp);
+    let tl = floor((u.pointer - u.off) / u.cell) * u.cell + u.off;
+    let l = css - tl;
+    let edge = min(min(l.x, l.y), min(u.cell - l.x, u.cell - l.y));
+    if (edge < 0.0 || edge > 1.0) { discard; }
+    return vec4f(INK, 0.6);
+  }
+`;
+
+async function main() {
+  if (!navigator.gpu) return fail('WebGPU not available in this browser');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return fail('No WebGPU adapter');
+  const device = await adapter.requestDevice();
+  device.lost.then(info => fail(`GPU lost: ${info.message}`));
+
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  /* ---- camera ---- */
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    await video.play();
+    statusEl.hidden = true;
+  } catch (err) {
+    return fail(`Camera unavailable (${err.name})`);
+  }
+
+  /* ---- pipelines ---- */
+  const blend = {
+    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+  };
+  const computeModule = device.createShaderModule({ code: COMPUTE });
+  const tileModule = device.createShaderModule({ code: TILES });
+  const overlayModule = device.createShaderModule({ code: OVERLAY });
+
+  const physics = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: computeModule, entryPoint: 'main' },
+  });
+  const render = (module, vs, fs, withBlend) => device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: vs },
+    fragment: { module, entryPoint: fs, targets: [{ format, blend: withBlend ? blend : undefined }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const tilePipe = render(tileModule, 'vs', 'fs', true);
+  const gridPipe = render(overlayModule, 'vs', 'grid', false);
+  const cursorPipe = render(overlayModule, 'vs', 'cursor', true);
+
+  const uniformData = new Float32Array(20);
+  const uniformBuf = device.createBuffer({ size: uniformData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const layerBufs = [0, 1].map(v => {
+    const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buf, 0, new Float32Array([v, 0, 0, 0]));
+    return buf;
+  });
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+  const gridBind = device.createBindGroup({
+    layout: gridPipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+  });
+  const cursorBind = device.createBindGroup({
+    layout: cursorPipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+  });
+
+  /* ---- layout: size the grid, centre it, give every cell a tile ---- */
+  let W = 0, H = 0, dpr = 1, cell = 0, cols = 0, rows = 0, offX = 0, offY = 0, count = 0;
+  let density = 72;   // tiles across the short side; [ and ] to change
+  const GAPS = [0, 1, 5];   // px between tiles; g to cycle
+  let gap = 0;
+  let tileBuf, physicsBind;
+
+  const layout = () => {
+    W = innerWidth;
+    H = innerHeight;
+    dpr = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+
+    // the gap widens the pitch rather than eating into the tile
+    cell = Math.max(3, Math.round(Math.min(W, H) / density)) + GAPS[gap];
+    cols = Math.ceil(W / cell);
+    rows = Math.ceil(H / cell);
+    offX = (W - cols * cell) / 2;
+    offY = (H - rows * cell) / 2;
+    count = cols * rows;
+
+    const init = new Float32Array(count * 4);
+    for (let i = 0; i < count; i++) {
+      init[i * 4]     = offX + (i % cols) * cell;
+      init[i * 4 + 1] = offY + Math.floor(i / cols) * cell;
+    }
+    tileBuf?.destroy();
+    tileBuf = device.createBuffer({ size: init.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(tileBuf, 0, init);
+
+    physicsBind = device.createBindGroup({
+      layout: physics.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: tileBuf } },
+      ],
+    });
+  };
+
+  /* ---- pointer ---- */
+  const pointer = { x: -9999, y: -9999, active: false };
+  // the feed is mirrored, so the pointer is mirrored into the same space
+  addEventListener('pointermove', e => {
+    pointer.x = W - e.clientX;
+    pointer.y = e.clientY;
+    pointer.active = true;
+  }, { passive: true });
+  document.addEventListener('pointerleave', () => {
+    pointer.active = false;
+    pointer.x = pointer.y = -9999;
+  });
+  addEventListener('resize', layout);
+  addEventListener('keydown', e => {
+    if (e.key === ']') density = Math.min(density * 1.25, 400);
+    else if (e.key === '[') density = Math.max(density / 1.25, 8);
+    else if (e.key === 'g') gap = (gap + 1) % GAPS.length;
+    else return;
+    layout();
+  });
+
+  /* ---- frame ---- */
+  const frame = () => {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const ready = video.readyState >= 2 && vw > 0;
+    const vScale = ready ? Math.max(W / vw, H / vh) : 1;
+
+    uniformData.set([
+      W, H,
+      offX, offY,
+      pointer.x, pointer.y,
+      ready ? (vw - W / vScale) / 2 : 0, ready ? (vh - H / vScale) / 2 : 0,
+      vw || 1, vh || 1,
+      cell, cols, count,
+      pointer.active && !reduced ? 1 : 0,
+      GAPS[gap] / 2,
+      dpr,
+      vScale,
+    ]);
+    device.queue.writeBuffer(uniformBuf, 0, uniformData);
+
+    const enc = device.createCommandEncoder();
+
+    const cp = enc.beginComputePass();
+    cp.setPipeline(physics);
+    cp.setBindGroup(0, physicsBind);
+    cp.dispatchWorkgroups(Math.ceil(count / 64));
+    cp.end();
+
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{
+        view: ctx.getCurrentTexture().createView(),
+        clearValue: [0, 0, 0, 1],
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
     });
 
-    start();
-  </script>
+    rp.setPipeline(gridPipe);
+    rp.setBindGroup(0, gridBind);
+    rp.draw(3);
+
+    if (ready) {
+      // external textures expire every frame, so their bind groups do too
+      const feed = device.importExternalTexture({ source: video });
+      rp.setPipeline(tilePipe);
+      for (const layerBuf of layerBufs) {
+        rp.setBindGroup(0, device.createBindGroup({
+          layout: tilePipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: uniformBuf } },
+            { binding: 1, resource: { buffer: tileBuf } },
+            { binding: 2, resource: sampler },
+            { binding: 3, resource: feed },
+            { binding: 4, resource: { buffer: layerBuf } },
+          ],
+        }));
+        rp.draw(6, count);
+      }
+    }
+
+    rp.setPipeline(cursorPipe);
+    rp.setBindGroup(0, cursorBind);
+    rp.draw(3);
+    rp.end();
+
+    device.queue.submit([enc.finish()]);
+    requestAnimationFrame(frame);
+  };
+
+  layout();
+  requestAnimationFrame(frame);
+}
+
+main().catch(err => { console.error(err); fail(err.message); });
+</script>
 </body>
 </html>
