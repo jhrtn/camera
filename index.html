@@ -59,23 +59,33 @@ const statusEl = document.getElementById('status');
 const fail = msg => { statusEl.hidden = false; statusEl.textContent = msg; };
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-/* ---- live parameters; the leva panel writes into this ---- */
-const params = {
-  density: 72,       // tiles across the short side
-  gap: 0,            // px between tiles
-  gridLines: 0.055,  // opacity of the grid behind the tiles
-  mirror: true,
-  cursor: true,
-  push: 32,
-  reach: 7,          // push radius, in cells
-  carry: 0.15,       // how much tiles get dragged along with the stroke
-  fullSpeed: 10,     // css px / frame that counts as a full push
-  spring: 0.07,
-  damping: 0.86,
-  fade: 0.55,        // how far displaced tiles fade, at most
+/* ---- starting values ---- */
+const DEFAULTS = {
+  density: 72, gap: 0, gridLines: 0.055,
+  push: 32, reach: 7, carry: 0.15, swirl: 0, fullSpeed: 10,
+  spring: 0.07, damping: 0.86, fade: 0.55,
+  srcStrength: 3, srcRate: 0.5, srcWave: 6, srcReach: 10, srcSwirl: 0,
 };
 
-/* ---- shared uniform block (128 bytes) ---- */
+/* ---- presets: saved looks; each sets every look-shaping parameter ---- */
+const PRESETS = {
+  drift: {
+    density: 28, gap: 1, gridLines: 0.06,
+    push: 120, reach: 17, carry: 0, swirl: 0, fullSpeed: 6,
+    spring: 0.01, damping: 0.57, fade: 1,
+    srcStrength: 6, srcRate: 0.3, srcWave: 8, srcReach: 14, srcSwirl: 0,
+  },
+};
+
+/* ---- live parameters; the leva panel writes into this ---- */
+const params = { ...DEFAULTS, mirror: true, cursor: true };
+
+/* ---- perturbation sources, placed by clicking a cell ---- */
+const MAX_SOURCES = 16;
+const sources = [];   // { x, y } in screen css px (a cell centre), born in seconds
+const clearSources = () => { sources.length = 0; };
+
+/* ---- shared uniform block (160 bytes) ---- */
 const UNIFORMS = /* wgsl */ `
   struct U {
     res: vec2f,      // css px
@@ -101,10 +111,20 @@ const UNIFORMS = /* wgsl */ `
     gridLines: f32,
     mirror: f32,
     cursor: f32,
+    swirl: f32,      // already sign-corrected for mirroring
+    srcCount: f32,
+    srcStrength: f32,
+    srcRate: f32,    // waves per second
+    srcWave: f32,    // wavelength, in cells
+    srcReach: f32,   // in cells
+    srcSwirl: f32,   // already sign-corrected for mirroring
   };
   struct Tile { pos: vec2f, vel: vec2f };
+  // xy: feed-space centre, z: age in seconds
+  struct Sources { s: array<vec4f, ${MAX_SOURCES}> };
 
   const INK = vec3f(244.0, 241.0, 234.0) / 255.0;
+  const TAU = 6.2831853;
 
   fn homeOf(i: u32) -> vec2f {
     let cols = u32(u.cols);
@@ -113,9 +133,16 @@ const UNIFORMS = /* wgsl */ `
   fn snapToGrid(p: vec2f) -> vec2f {
     return round((p - u.off) / u.cell) * u.cell + u.off;
   }
+  fn cellOf(p: vec2f) -> vec2f {
+    return floor((p - u.off) / u.cell) * u.cell + u.off;
+  }
   // feed space -> screen x, flipping when mirrored
   fn screenX(x: f32) -> f32 {
     return select(x, u.res.x - x, u.mirror > 0.5);
+  }
+  // perpendicular, clockwise on screen when not mirrored (y points down)
+  fn perp(d: vec2f) -> vec2f {
+    return vec2f(-d.y, d.x);
   }
 `;
 
@@ -123,6 +150,7 @@ const UNIFORMS = /* wgsl */ `
 const COMPUTE = /* wgsl */ `
   @group(0) @binding(0) var<uniform> u: U;
   @group(0) @binding(1) var<storage, read_write> tiles: array<Tile>;
+  @group(0) @binding(2) var<uniform> src: Sources;
   ${UNIFORMS}
 
   @compute @workgroup_size(64)
@@ -130,18 +158,35 @@ const COMPUTE = /* wgsl */ `
     let i = id.x;
     if (i >= u32(u.count)) { return; }
     var t = tiles[i];
+    let centre = t.pos + u.cell * 0.5;
 
     // only a moving pointer disturbs the grid, so a resting one lets it heal
     if (u.engaged > 0.5 && u.energy > 0.001) {
       // push from the tile's centre so the wake is symmetric round the cursor
-      let d = t.pos + u.cell * 0.5 - u.pointer;
+      let d = centre - u.pointer;
       let dist = max(length(d), 0.001);
       let radius = u.cell * u.reach;
       if (dist < radius) {
         let falloff = pow(1.0 - dist / radius, 2.0);
-        t.vel += d * (falloff * u.push * u.energy / dist);
+        let dir = d / dist;
+        t.vel += (dir + perp(dir) * u.swirl) * (falloff * u.push * u.energy);
         // and carry tiles along the stroke, shuffling them into other cells
         t.vel += u.vel * falloff * u.carry;
+      }
+    }
+
+    // sources send out waves that keep rolling while the pointer rests
+    for (var k = 0u; k < u32(u.srcCount); k++) {
+      let s = src.s[k];
+      let d = centre - s.xy;
+      let dist = max(length(d), 0.001);
+      let radius = u.cell * u.srcReach;
+      if (dist < radius) {
+        let falloff = pow(1.0 - dist / radius, 2.0);
+        let dir = d / dist;
+        // ease each source in over its first half second
+        let wave = sin(TAU * (s.z * u.srcRate - dist / (u.cell * u.srcWave))) * min(s.z * 2.0, 1.0);
+        t.vel += (dir * wave + perp(dir) * u.srcSwirl) * (falloff * u.srcStrength);
       }
     }
 
@@ -204,9 +249,10 @@ const TILES = /* wgsl */ `
   }
 `;
 
-/* ---- full-screen passes: the faint grid underneath, the cursor cell on top ---- */
+/* ---- full-screen passes: the faint grid underneath, cursor and sources on top ---- */
 const OVERLAY = /* wgsl */ `
   @group(0) @binding(0) var<uniform> u: U;
+  @group(0) @binding(1) var<uniform> src: Sources;
   ${UNIFORMS}
 
   @vertex
@@ -228,11 +274,20 @@ const OVERLAY = /* wgsl */ `
   }
 
   @fragment
-  fn cursor(@builtin(position) fp: vec4f) -> @location(0) vec4f {
-    if (u.engaged < 0.5 || u.cursor < 0.5) { discard; }
+  fn overlay(@builtin(position) fp: vec4f) -> @location(0) vec4f {
     let css = feedSpace(fp);
-    let tl = floor((u.pointer - u.off) / u.cell) * u.cell + u.off;
-    let l = css - tl;
+
+    // each source is a small square in its cell, breathing with its wave
+    for (var k = 0u; k < u32(u.srcCount); k++) {
+      let s = src.s[k];
+      let l = abs(css - (cellOf(s.xy) + u.cell * 0.5));
+      if (max(l.x, l.y) < max(1.5, u.cell * 0.16)) {
+        return vec4f(INK, 0.55 + 0.35 * sin(TAU * s.z * u.srcRate));
+      }
+    }
+
+    if (u.engaged < 0.5 || u.cursor < 0.5) { discard; }
+    let l = css - cellOf(u.pointer);
     let edge = min(min(l.x, l.y), min(u.cell - l.x, u.cell - l.y));
     if (edge < 0.0 || edge > 1.0) { discard; }
     return vec4f(INK, 0.6);
@@ -286,10 +341,12 @@ async function main() {
   });
   const tilePipe = render(tileModule, 'vs', 'fs', true);
   const gridPipe = render(overlayModule, 'vs', 'grid', false);
-  const cursorPipe = render(overlayModule, 'vs', 'cursor', true);
+  const overlayPipe = render(overlayModule, 'vs', 'overlay', true);
 
-  const uniformData = new Float32Array(32);
+  const uniformData = new Float32Array(40);
   const uniformBuf = device.createBuffer({ size: uniformData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const sourceData = new Float32Array(MAX_SOURCES * 4);
+  const sourceBuf = device.createBuffer({ size: sourceData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const layerBufs = [0, 1].map(v => {
     const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(buf, 0, new Float32Array([v, 0, 0, 0]));
@@ -301,9 +358,12 @@ async function main() {
     layout: gridPipe.getBindGroupLayout(0),
     entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
   });
-  const cursorBind = device.createBindGroup({
-    layout: cursorPipe.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+  const overlayBind = device.createBindGroup({
+    layout: overlayPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: sourceBuf } },
+    ],
   });
 
   /* ---- layout: size the grid, centre it, give every cell a tile ---- */
@@ -340,12 +400,15 @@ async function main() {
       entries: [
         { binding: 0, resource: { buffer: uniformBuf } },
         { binding: 1, resource: { buffer: tileBuf } },
+        { binding: 2, resource: { buffer: sourceBuf } },
       ],
     });
-    laidOut = `${W}x${H}@${dpr}:${params.density}/${params.gap}`;
+    laidOut = layoutKey();
   };
   // rebuild whenever the window or a grid-shaping control changes
   const layoutKey = () => `${innerWidth}x${innerHeight}@${Math.min(devicePixelRatio || 1, 2)}:${params.density}/${params.gap}`;
+
+  const toFeedX = x => params.mirror ? W - x : x;
 
   /* ---- pointer, tracked on the canvas so using the panel leaves the grid alone ---- */
   const pointer = { x: 0, y: 0, active: false };
@@ -355,6 +418,21 @@ async function main() {
     pointer.active = true;
   }, { passive: true });
   canvas.addEventListener('pointerleave', () => { pointer.active = false; });
+
+  // click a cell to drop a source there; click it again to remove it
+  canvas.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    const fx = toFeedX(e.clientX);
+    const cx = Math.floor((fx - offX) / cell) * cell + offX + cell / 2;
+    const cy = Math.floor((e.clientY - offY) / cell) * cell + offY + cell / 2;
+    const x = toFeedX(cx);
+    const hit = sources.findIndex(s => Math.abs(s.x - x) < cell / 2 && Math.abs(s.y - cy) < cell / 2);
+    if (hit >= 0) sources.splice(hit, 1);
+    else {
+      if (sources.length === MAX_SOURCES) sources.shift();
+      sources.push({ x, y: cy, born: performance.now() / 1000 });
+    }
+  });
 
   /* ---- pointer motion, smoothed so pointer events and frames needn't line up ---- */
   const motion = { lastX: 0, lastY: 0, vx: 0, vy: 0, seen: false };
@@ -374,16 +452,19 @@ async function main() {
   const frame = () => {
     if (layoutKey() !== laidOut) layout();
 
+    const now = performance.now() / 1000;
     const energy = trackMotion();
+    // mirroring flips x, so flip velocity and spin with it
     const flip = params.mirror ? -1 : 1;
     const vw = video.videoWidth, vh = video.videoHeight;
     const ready = video.readyState >= 2 && vw > 0;
     const vScale = ready ? Math.max(W / vw, H / vh) : 1;
+    const srcCount = reduced ? 0 : sources.length;
 
     uniformData.set([
       W, H,
       offX, offY,
-      params.mirror ? W - pointer.x : pointer.x, pointer.y,
+      toFeedX(pointer.x), pointer.y,
       ready ? (vw - W / vScale) / 2 : 0, ready ? (vh - H / vScale) / 2 : 0,
       vw || 1, vh || 1,
       motion.vx * flip, motion.vy,
@@ -398,8 +479,15 @@ async function main() {
       params.gridLines,
       params.mirror ? 1 : 0,
       params.cursor ? 1 : 0,
+      params.swirl * flip,
+      srcCount,
+      params.srcStrength, params.srcRate, params.srcWave, params.srcReach,
+      params.srcSwirl * flip,
     ]);
     device.queue.writeBuffer(uniformBuf, 0, uniformData);
+
+    sources.forEach((s, k) => sourceData.set([toFeedX(s.x), s.y, now - s.born, 0], k * 4));
+    device.queue.writeBuffer(sourceBuf, 0, sourceData);
 
     const enc = device.createCommandEncoder();
 
@@ -441,8 +529,8 @@ async function main() {
       }
     }
 
-    rp.setPipeline(cursorPipe);
-    rp.setBindGroup(0, cursorBind);
+    rp.setPipeline(overlayPipe);
+    rp.setBindGroup(0, overlayBind);
     rp.draw(3);
     rp.end();
 
@@ -456,7 +544,7 @@ async function main() {
 
 /* ---- controls: a leva panel, loaded separately so the sketch runs without it ---- */
 async function mountControls() {
-  const [React, { createRoot }, { Leva, useControls, folder }] = await Promise.all([
+  const [React, { createRoot }, { Leva, useControls, folder, button, buttonGroup }] = await Promise.all([
     import('react'), import('react-dom/client'), import('leva'),
   ]);
   const h = React.createElement;
@@ -464,7 +552,13 @@ async function mountControls() {
 
   function Controls() {
     const [hidden, setHidden] = React.useState(false);
+    const setRef = React.useRef(null);
+    const applyPreset = name => setRef.current?.(PRESETS[name]);
+
     const [values, set] = useControls(() => ({
+      preset: buttonGroup(
+        Object.fromEntries(Object.keys(PRESETS).map(name => [name, () => applyPreset(name)]))
+      ),
       grid: folder({
         density: { value: params.density, min: 8, max: 300, step: 1, label: 'tiles' },
         gap: { value: params.gap, min: 0, max: 10, step: 1, label: 'gap px' },
@@ -473,15 +567,25 @@ async function mountControls() {
         cursor: { value: params.cursor, label: 'cursor cell' },
       }),
       motion: folder({
-        push: { value: params.push, min: 0, max: 120, step: 1 },
-        reach: { value: params.reach, min: 1, max: 24, step: 0.5, label: 'reach cells' },
+        push: { value: params.push, min: 0, max: 200, step: 1 },
+        reach: { value: params.reach, min: 1, max: 30, step: 0.5, label: 'reach cells' },
+        swirl: { value: params.swirl, min: -5, max: 5, step: 0.1 },
         carry: { value: params.carry, min: 0, max: 1, step: 0.01 },
         fullSpeed: { value: params.fullSpeed, min: 1, max: 40, step: 0.5, label: 'full speed' },
-        spring: { value: params.spring, min: 0.005, max: 0.3, step: 0.005 },
-        damping: { value: params.damping, min: 0.5, max: 0.99, step: 0.01 },
+        spring: { value: params.spring, min: 0.001, max: 0.3, step: 0.001 },
+        damping: { value: params.damping, min: 0.3, max: 0.99, step: 0.01 },
         fade: { value: params.fade, min: 0, max: 1, step: 0.01, label: 'trail fade' },
       }),
+      sources: folder({
+        srcStrength: { value: params.srcStrength, min: 0, max: 20, step: 0.1, label: 'strength' },
+        srcRate: { value: params.srcRate, min: 0, max: 3, step: 0.05, label: 'waves / s' },
+        srcWave: { value: params.srcWave, min: 1, max: 30, step: 0.5, label: 'wavelength' },
+        srcReach: { value: params.srcReach, min: 1, max: 40, step: 0.5, label: 'reach cells' },
+        srcSwirl: { value: params.srcSwirl, min: -5, max: 5, step: 0.1, label: 'swirl' },
+        'clear (c)': button(clearSources),
+      }),
     }));
+    setRef.current = set;
 
     // the frame loop reads params every frame, so this is all the wiring it needs
     Object.assign(params, values);
@@ -496,6 +600,7 @@ async function mountControls() {
           const i = GAP_STEPS.indexOf(params.gap);
           set({ gap: GAP_STEPS[(i + 1) % GAP_STEPS.length] });
         }
+        else if (e.key === 'c') clearSources();
         else if (e.key === 'h') setHidden(v => !v);
       };
       addEventListener('keydown', onKey);
