@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Camera</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #0b0b0b;
+      color: #eee;
+      font: 14px/1.4 system-ui, sans-serif;
+    }
+    main { width: min(960px, 100vw - 32px); display: grid; gap: 12px; }
+    video {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 8px;
+      object-fit: cover;
+    }
+    video.mirrored { transform: scaleX(-1); }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    select, button {
+      font: inherit;
+      color: inherit;
+      background: #1c1c1c;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 6px 10px;
+    }
+    button { cursor: pointer; }
+    #status { color: #888; margin-left: auto; }
+  </style>
+</head>
+<body>
+  <main>
+    <video id="video" class="mirrored" autoplay playsinline muted></video>
+    <div class="controls">
+      <select id="devices" aria-label="Camera"></select>
+      <button id="mirror">Mirror: on</button>
+      <span id="status">Requesting camera…</span>
+    </div>
+  </main>
+
+  <script>
+    const video = document.getElementById('video');
+    const devicesEl = document.getElementById('devices');
+    const mirrorBtn = document.getElementById('mirror');
+    const statusEl = document.getElementById('status');
+    let stream;
+
+    async function start(deviceId) {
+      stream?.getTracks().forEach((t) => t.stop());
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: deviceId
+            ? { deviceId: { exact: deviceId } }
+            : { width: { ideal: 1920 }, height: { ideal: 1080 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        const s = stream.getVideoTracks()[0].getSettings();
+        statusEl.textContent = `${s.width}×${s.height} @ ${Math.round(s.frameRate ?? 0)}fps`;
+        await listDevices(s.deviceId);
+      } catch (err) {
+        statusEl.textContent = `Camera error: ${err.name}`;
+        console.error(err);
+      }
+    }
+
+    async function listDevices(activeId) {
+      const cams = (await navigator.mediaDevices.enumerateDevices())
+        .filter((d) => d.kind === 'videoinput');
+      devicesEl.innerHTML = cams
+        .map((d, i) => `<option value="${d.deviceId}">${d.label || `Camera ${i + 1}`}</option>`)
+        .join('');
+      devicesEl.value = activeId;
+    }
+
+    devicesEl.addEventListener('change', () => start(devicesEl.value));
+    mirrorBtn.addEventListener('click', () => {
+      const on = video.classList.toggle('mirrored');
+      mirrorBtn.textContent = `Mirror: ${on ? 'on' : 'off'}`;
+    });
+
+    start();
+  </script>
+</body>
+</html>
